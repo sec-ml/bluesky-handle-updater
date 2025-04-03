@@ -1,0 +1,299 @@
+# MIT License
+#
+# Copyright (c) 2025 sec-ml
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+name: Update Bluesky Handle
+
+on:
+  schedule:
+    - cron: "0 */12 * * *" # run every 12 hours
+  workflow_dispatch: # workflow_dispatch allows manually triggering
+
+env:
+  TEST_RUN: ${{ vars.TEST_RUN }} # test mode (print output, don't make changes)
+  KEEP_ATPROTO_RECORDS: ${{ vars.KEEP_ATPROTO_RECORDS }} # if tidying old TXT records, which should we keep? comma-sep list
+  MY_DOMAIN: ${{ vars.MY_DOMAIN }} # domain name
+  GH_USERNAME: ${{ vars.GH_USERNAME }} # GitHub username used for activity lookup
+
+jobs:
+  update-handle:
+    runs-on: ubuntu-latest
+    outputs:
+      handle_updated: ${{ steps.update_handle.outputs.success }}
+      updated_handle: ${{ steps.update_handle.outputs.handle }}
+    steps:
+      - name: Get recent GitHub commit data (public + private)
+        id: commits
+        run: |
+          # define timestamps
+          now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          since=$(date -u -d "24 hours ago" +"%Y-%m-%dT%H:%M:%SZ")
+
+          # count public commits using public GitHub Events API
+          echo "Counting public commits via public GitHub Events API."
+          public_events=$(curl -s "https://api.github.com/users/$GH_USERNAME/events/public")
+          public_commits=$(echo "$public_events" | jq '[.[] | select(.type == "PushEvent" and .created_at > "'$since'")] | map(.payload.commits | length) | add // 0')
+          echo "Public commits (prev 24 hours): $public_commits"
+
+          private_commits=0
+
+          # use GH_TOKEN (if set) to access private repos and count commits
+          if [ -n "${{ secrets.GH_TOKEN }}" ]; then
+            echo "GH_TOKEN detected — checking private repo commits."
+            page=1
+            while : ; do
+              response=$(curl -s -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
+                "https://api.github.com/user/repos?visibility=private&affiliation=owner,collaborator,organization_member&per_page=100&page=$page")
+
+              repo_count=$(echo "$response" | jq length)
+              [ "$repo_count" -eq 0 ] && break
+
+              private_repos=$(echo "$response" | jq -r '.[] | select(.private == true) | "\(.owner.login)/\(.name)"')
+              for repo in $private_repos; do
+                commit_count=$(curl -s -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
+                  "https://api.github.com/repos/$repo/commits?author=$GH_USERNAME&since=$since" | jq length)
+                echo "$repo: $commit_count commit(s)"
+                private_commits=$((private_commits + commit_count))
+              done
+              page=$((page + 1))
+            done
+          fi
+
+          total_commits=$((public_commits + private_commits))
+          ## TODO: add a var to switch to 'days since commit' mode, rather than commenting above out and setting 'total_commits=0'
+
+          # calculate days since last public and private commit
+          latest_public=$(echo "$public_events" | jq -r '[.[] | select(.type == "PushEvent")][0].created_at // empty')
+          latest_private=""
+
+          if [ -n "${{ secrets.GH_TOKEN }}" ]; then
+            all_private_dates=()
+            for repo in $private_repos; do
+              date=$(curl -s -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
+                "https://api.github.com/repos/$repo/commits?author=$GH_USERNAME&per_page=1" | jq -r '.[0].commit.author.date // empty')
+              if [ -n "$date" ]; then
+                all_private_dates+=("$date")
+              fi
+            done
+            latest_private=$(printf "%s\n" "${all_private_dates[@]}" | sort -r | head -n1)
+          fi
+
+          # compare public and private latest timestamps
+          if [ -n "$latest_public" ] && [ -n "$latest_private" ]; then
+            latest_commit=$( [ $(date -d "$latest_private" +%s) -gt $(date -d "$latest_public" +%s) ] && echo "$latest_private" || echo "$latest_public" )
+          elif [ -n "$latest_private" ]; then
+            latest_commit="$latest_private"
+          elif [ -n "$latest_public" ]; then
+            latest_commit="$latest_public"
+          else
+            latest_commit=""
+          fi
+
+          # calculate number of days
+          if [ -n "$latest_commit" ]; then
+            now_sec=$(date -u +"%s")
+            commit_sec=$(date -d "$latest_commit" -u +"%s")
+            days_since=$(( (now_sec - commit_sec) / 86400 ))
+          else
+            days_since=999
+          fi
+
+          # output results to workflow
+          echo "Total recent commits (public + private): $total_commits"
+          echo "Days since last public commit: $days_since"
+          echo "recent=$total_commits" >> "$GITHUB_OUTPUT"
+          echo "days=$days_since" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to Bluesky and get DID
+        id: get_did
+        run: |
+          # authenticate to Bluesky and fetch JWT + DID
+          response=$(curl -s -X POST https://bsky.social/xrpc/com.atproto.server.createSession \
+            -H "Content-Type: application/json" \
+            -d "{\"identifier\":\"${{ secrets.BLUESKY_EMAIL }}\",\"password\":\"${{ secrets.BLUESKY_PASSWORD }}\"}")
+          jwt=$(echo "$response" | jq -r '.accessJwt')
+          did=$(echo "$response" | jq -r '.did')
+          echo "jwt=$jwt" >> "$GITHUB_OUTPUT"
+          echo "did=$did" >> "$GITHUB_OUTPUT"
+
+      - name: Determine handle string
+        id: handle
+        run: |
+          # decide handle format based on commit activity:
+          # number of commits in the last day, or
+          # days since last commit
+          recent=${{ steps.commits.outputs.recent }}
+          days=${{ steps.commits.outputs.days }}
+
+          if [ "$recent" -gt 0 ]; then
+            suffix="commit"
+            [ "$recent" -gt 1 ] && suffix="commits"
+            handle="$recent.$suffix.today.$MY_DOMAIN"
+          else
+            suffix="day"
+            [ "$days" -gt 1 ] && suffix="days"
+            handle="$days.$suffix.since.last.commit.$MY_DOMAIN"
+          fi
+
+          subdomain="_atproto.$handle"
+          echo "subdomain=$subdomain" >> "$GITHUB_OUTPUT"
+          echo "handle=$handle" >> "$GITHUB_OUTPUT"
+
+      - name: Get current handle associated with DID
+        id: current_handle
+        run: |
+          # fetch the current handle using the DID and JWT
+          profile=$(curl -s -X GET "https://bsky.social/xrpc/app.bsky.actor.getProfile?actor=${{ steps.get_did.outputs.did }}" \
+            -H "Authorization: Bearer ${{ steps.get_did.outputs.jwt }}")
+          echo "Full profile response: $profile"
+          handle_value=$(echo "$profile" | jq -r '.handle // "(unknown)"')
+          echo "Current handle: $handle_value"
+          echo "current_handle=$handle_value" >> "$GITHUB_OUTPUT"
+
+          # DEBUG: Show both current and proposed handle for comparison
+          echo "DEBUG: Comparing current handle '$handle_value' to proposed '${{ steps.handle.outputs.handle }}'"
+
+          # Assume update is needed, and override if not
+          echo "HANDLE_UPDATE_REQUIRED=true" >> "$GITHUB_ENV"
+          if [ "$handle_value" = "${{ steps.handle.outputs.handle }}" ]; then
+            echo "Handle is already up to date."
+            echo "HANDLE_UPDATE_REQUIRED=false" >> "$GITHUB_ENV"
+          else
+            echo "Handle needs to be updated."
+          fi
+
+      - name: Create TXT record
+        if: env.HANDLE_UPDATE_REQUIRED == 'true'
+        run: |
+          if [ "$TEST_RUN" = "true" ]; then
+            # TEST_RUN: Print what would be created
+            echo "TEST RUN: Would create TXT record."
+            echo "Name: ${{ steps.handle.outputs.subdomain }}"
+            echo "Content: \"did=${{ steps.get_did.outputs.did }}\""
+          else
+            # create DNS TXT record for Bluesky handle verification
+            echo "Creating TXT record."
+            data=$(jq -n \
+              --arg type "TXT" \
+              --arg name "${{ steps.handle.outputs.subdomain }}" \
+              --arg content "\"did=${{ steps.get_did.outputs.did }}\"" \
+              --argjson ttl 120 \
+              '{type: $type, name: $name, content: $content, ttl: $ttl, proxied: false}')
+            curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${{ secrets.CLOUDFLARE_ZONE_ID }}/dns_records" \
+              -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              --data "$data"
+
+            echo "Created TXT record: ${{ steps.handle.outputs.subdomain }}"
+            echo "Current _atproto records to keep: '$KEEP_ATPROTO_RECORDS'"
+
+            # append new subdomain to env var so it won't be deleted during TXT cleanup
+            combined="$KEEP_ATPROTO_RECORDS,${{ steps.handle.outputs.subdomain }}"
+            echo "Appending to GITHUB_ENV: KEEP_ATPROTO_RECORDS=$combined"
+            echo "KEEP_ATPROTO_RECORDS=$combined" >> "$GITHUB_ENV"
+          fi
+
+      - name: Update handle on Bluesky
+        id: update_handle
+        if: env.HANDLE_UPDATE_REQUIRED == 'true'
+        run: |
+          if [ "$TEST_RUN" = "true" ]; then
+            # TEST_RUN: Don't actually update the handle
+            echo "TEST RUN: Would update Bluesky handle to:"
+            echo "${{ steps.handle.outputs.handle }}"
+            echo "success=false" >> "$GITHUB_OUTPUT"
+            echo "handle=${{ steps.handle.outputs.handle }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Waiting 10 seconds for DNS to propagate."
+            sleep 10
+
+            # Try handle update
+            echo "Updating Bluesky handle..."
+            response=$(curl -s -X POST "https://bsky.social/xrpc/com.atproto.identity.updateHandle" \
+              -H "Authorization: Bearer ${{ steps.get_did.outputs.jwt }}" \
+              -H "Content-Type: application/json" \
+              -d "{\"handle\":\"${{ steps.handle.outputs.handle }}\"}")
+
+            echo "$response" | jq .
+            error=$(echo "$response" | jq -r '.error // empty')
+            message=$(echo "$response" | jq -r '.message // empty')
+
+            # Retry after 60 seconds if handle doesn't resolve to DID yet (DNS lookup delay)
+            if [ "$error" = "InvalidRequest" ] && [ "$message" = "External handle did not resolve to DID" ]; then
+              echo "First attempt failed due to DNS delay. Retrying in 60 seconds..."
+              sleep 60
+              response=$(curl -s -X POST "https://bsky.social/xrpc/com.atproto.identity.updateHandle" \
+                -H "Authorization: Bearer ${{ steps.get_did.outputs.jwt }}" \
+                -H "Content-Type: application/json" \
+                -d "{\"handle\":\"${{ steps.handle.outputs.handle }}\"}")
+              echo "$response" | jq .
+              error=$(echo "$response" | jq -r '.error // empty')
+            fi
+
+            # Pass success/failure & new handle back to the workflow
+            if [ -z "$error" ]; then
+              echo "Handle updated successfully"
+              echo "::notice title=Handle Updated::${{ steps.handle.outputs.handle }}"
+              echo "::notice title=Handle Update Success::true"
+              echo "success=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Handle update failed with error: $error"
+              echo "::notice title=Handle Updated::${{ steps.handle.outputs.handle }}"
+              echo "::notice title=Handle Update Success::false"
+              echo "success=false" >> "$GITHUB_OUTPUT"
+            fi
+            echo "handle=${{ steps.handle.outputs.handle }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Clean up old TXT records
+        if: env.HANDLE_UPDATE_REQUIRED == 'true' && vars.CLEANUP_TXT_RECORDS == 'true'
+        run: |
+          echo "Checking _atproto.* TXT records in Cloudflare..."
+          IFS=',' read -ra KEEP <<< "$KEEP_ATPROTO_RECORDS"
+          for i in "${!KEEP[@]}"; do KEEP[$i]=$(echo "${KEEP[$i]}" | xargs); done
+          records=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${{ secrets.CLOUDFLARE_ZONE_ID }}/dns_records?type=TXT" \
+            -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+            -H "Content-Type: application/json")
+
+          # Delete all _atproto TXT records except the ones in defined keep lis (+ new current handle)
+          echo "$records" | jq -c '.result[] | select(.name | startswith("_atproto."))' | while read -r record; do
+            name=$(echo "$record" | jq -r '.name')
+            id=$(echo "$record" | jq -r '.id')
+            keep=false
+            for k in "${KEEP[@]}"; do
+              if [[ "$name" == "$k" ]]; then
+                keep=true
+                break
+              fi
+            done
+            if [ "$keep" = false ]; then
+              if [ "$TEST_RUN" = "true" ]; then
+                echo "TEST RUN: Would delete $name (ID: $id)"
+              else
+                echo "Deleting $name (ID: $id)"
+                curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/${{ secrets.CLOUDFLARE_ZONE_ID }}/dns_records/$id" \
+                  -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+                  -H "Content-Type: application/json"
+              fi
+            else
+              echo "Keep: $name"
+            fi
+          done
