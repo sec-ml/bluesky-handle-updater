@@ -24,7 +24,7 @@ name: Update Bluesky Handle
 
 on:
   schedule:
-    - cron: "0 */12 * * *" # run every 12 hours
+    #- cron: "0 */12 * * *" # run every 12 hours
   workflow_dispatch: # workflow_dispatch allows manually triggering
 
 env:
